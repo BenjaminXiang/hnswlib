@@ -428,8 +428,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         lower_bound = dist;
         min_candidate.emplace(currObj, dist);
         max_candidate.emplace(currObj, dist);
-        // top_candidates.emplace(dist, currObj);
-        // candidate_set.emplace(-dist, currObj);
 
         visited_array[currObj] = visited_array_tag;
 
@@ -464,9 +462,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         }
                     }
                 }
-                dist_t dist = imi.get_next((float *)query, imi_row, imi_col);
-                if (imi_row >= 0) {
-                    min_candidate.emplace(imi_row, imi_col, dist);
+                if (!imi.empty()) {
+                    dist_t dist = imi.get_next((float *)query, imi_row, imi_col);
+                    if (imi_row >= 0 && imi_col >= 0 && imi.size(imi_row, imi_col)) {
+                        min_candidate.emplace(imi_row, imi_col, dist);
+                    }
                 }
             } else {
                 tableint internal_id = top_node.id_;
@@ -504,9 +504,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             }
                         }
                     }
-
                 }
-
             }
         }
 
