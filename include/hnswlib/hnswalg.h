@@ -8,8 +8,12 @@
 #include <assert.h>
 #include <unordered_set>
 #include <list>
+#include <imi/imi.h>
+#include <imi/l2_inverted_list.h>
+#include <utils/result_utils.h>
 
 namespace hnswlib {
+
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
@@ -378,10 +382,454 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchWithImi(const void *query, size_t k, imi::ImiIndex &imi) const {
+        std::size_t ef = std::max(ef_, k);
+        std::priority_queue<std::pair<dist_t, labeltype>> result;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        dist_t lower_bound;
+        dist_t dist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+        lower_bound = dist;
+        top_candidates.emplace(dist, currObj);
+        candidate_set.emplace(-dist, currObj);
+
+        visited_array[currObj] = visited_array_tag;
+
+        std::vector<std::size_t> imi_bucket = imi.first((float *) query);
+        if (imi_bucket.size() == 0) {
+            imi_bucket = imi.get_next((float *) query);
+        }
+
+        for (const auto &id:imi_bucket) {
+            tableint internal_id = label_lookup_.find(id)->second;
+            if(!(visited_array[internal_id]==visited_array_tag)) {
+                dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+                top_candidates.emplace(dist, internal_id);
+                candidate_set.emplace(-dist, internal_id);
+                visited_array[internal_id] = visited_array_tag;
+            }
+        }
+
+        lower_bound = top_candidates.top().first;
+
+        while(!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+
+            if ((-current_node_pair.first) > lower_bound && (top_candidates.size() == ef)) {
+                break;
+            }
+
+            if (-current_node_pair.first < imi.top_dist()) {
+                candidate_set.pop();
+
+                tableint current_node_id = current_node_pair.second;
+                int *data = (int *) get_linklist0(current_node_id);
+                size_t size = getListCount((linklistsizeint*)data);
+    //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+                _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+                for (size_t j = 1; j <= size; j++) {
+                    int candidate_id = *(data + j);
+//                    if (candidate_id == 0) continue;
+#ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                    _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);  ////////////
+#endif
+                    if (!(visited_array[candidate_id] == visited_array_tag)) {
+                        visited_array[candidate_id] = visited_array_tag;
+
+                        char *currObj1 = (getDataByInternalId(candidate_id));
+                        dist_t dist = fstdistfunc_(query, currObj1, dist_func_param_);
+
+                        if (top_candidates.size() < ef || lower_bound > dist) {
+                            candidate_set.emplace(-dist, candidate_id);
+// #ifdef USE_SSE
+//                             _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+//                                             offsetLevel0_,  ///////////
+//                                             _MM_HINT_T0);  ////////////////////////
+// #endif
+                            // if ((!has_deletions || !isMarkedDeleted(candidate_id)))
+                            top_candidates.emplace(dist, candidate_id);
+
+                            if (top_candidates.size() > ef)
+                                top_candidates.pop();
+
+                            if (!top_candidates.empty())
+                                lower_bound = top_candidates.top().first;
+                        }
+                    }
+                }
+            } else {
+                imi_bucket = imi.get_next((float *) query);
+                for (const auto &id:imi_bucket) {
+                    tableint internal_id = label_lookup_.find(id)->second;
+                    if (!(visited_array[internal_id]==visited_array_tag)) {
+                        visited_array[internal_id] = visited_array_tag;
+                        dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+
+                        if (top_candidates.size() < ef || lower_bound > dist) {
+                            candidate_set.emplace(-dist, internal_id);
+                            top_candidates.emplace(dist, internal_id);
+
+                            if (top_candidates.size() > ef)
+                                top_candidates.pop();
+
+                            if (!top_candidates.empty())
+                                lower_bound = top_candidates.top().first;
+                        }
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+
+        while(top_candidates.size() > k) {
+            top_candidates.pop();
+        }
+
+        while(top_candidates.size() > 0) {
+            std::pair<dist_t, tableint> rez = top_candidates.top();
+            result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            top_candidates.pop();
+        }
+        return result;
+    }
+
+
+    void
+    searchWithIMI(const void *query, size_t k, imi::ImiIndex &imi, utils::ResultPool<float> &result) const {
+        std::size_t ef = std::max(ef_, k);
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MinHeap<float>> min_candidate;
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MaxHeap<float>> max_candidate;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        dist_t lower_bound;
+        dist_t dist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+        lower_bound = dist;
+        min_candidate.emplace(currObj, dist);
+        max_candidate.emplace(currObj, dist);
+        // top_candidates.emplace(dist, currObj);
+        // candidate_set.emplace(-dist, currObj);
+
+        visited_array[currObj] = visited_array_tag;
+
+        int imi_row, imi_col;
+        dist = imi.first((float *) query, imi_row, imi_col);
+        min_candidate.emplace(imi_row, imi_col, dist);
+
+        while(!min_candidate.empty()) {
+            utils::Node<float> top_node = min_candidate.top();
+            min_candidate.pop();
+
+            if (top_node.first_bit()) {
+                top_node.parse_id(imi_row, imi_col);
+                std::vector<std::size_t> inverted_list = imi.get_bucket(imi_row, imi_col);
+                for (const auto &id:inverted_list) {
+                    tableint internal_id = label_lookup_.find(id)->second;
+                    if (!(visited_array[internal_id]==visited_array_tag)) {
+                        visited_array[internal_id] = visited_array_tag;
+                        dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(internal_id, dist);
+                            max_candidate.emplace(internal_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+                }
+                dist_t dist = imi.get_next((float *)query, imi_row, imi_col);
+                if (imi_row >= 0) {
+                    min_candidate.emplace(imi_row, imi_col, dist);
+                }
+            } else {
+                tableint internal_id = top_node.id_;
+                int *data = (int *)get_linklist0(internal_id);
+                std::size_t size = getListCount((linklistsizeint *)data);
+#ifdef USE_SSE
+      _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+      _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+      _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+      _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#endif
+                for (std::size_t i=1; i<size; ++i) {
+                    int cand_id = *(data + i);
+#ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
+                    _mm_prefetch(data_level0_memory_ + (*(data + i + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);  ////////////
+#endif
+                    if (!(visited_array[cand_id] == visited_array_tag)) {
+                        visited_array[cand_id] = visited_array_tag;
+
+                        char *curr_data = (getDataByInternalId(cand_id));
+                        dist_t dist = fstdistfunc_(query, curr_data, dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(cand_id, dist);
+                            max_candidate.emplace(cand_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+
+                }
+
+            }
+        }
+
+        while(max_candidate.size() > k) {
+            max_candidate.pop();
+        }
+
+        while(max_candidate.size() > 0) {
+            // std::pair<dist_t, tableint> rez = top_candidates.top();
+            // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            for (std::size_t l=0; l<k; ++l) {
+                utils::Node<float> top_node = max_candidate.top();
+                result.emplace(top_node.id_, top_node.dist_, k-l-1);
+                max_candidate.pop();
+            }
+        }
+        // return result;
+    }
+
+
+    void
+    searchWithIVF(const void *query, size_t k, imi::InvertedList &ivf, utils::ResultPool<float> &result) const {
+        std::size_t ef = std::max(ef_, k);
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MinHeap<float>> min_candidate;
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MaxHeap<float>> max_candidate;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        dist_t lower_bound;
+        dist_t dist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+        lower_bound = dist;
+        min_candidate.emplace(currObj, dist);
+        max_candidate.emplace(currObj, dist);
+
+        visited_array[currObj] = visited_array_tag;
+
+        ivf.init((float *) query);
+        int ivf_idx;
+        dist = ivf.pop(ivf_idx);
+        min_candidate.emplace(dist, ivf_idx);
+
+        while(!min_candidate.empty()) {
+            utils::Node<float> top_node = min_candidate.top();
+            min_candidate.pop();
+
+            if (top_node.first_bit()) {
+                std::vector<std::size_t> inverted_list = ivf.get_bucket(top_node);
+                for (const auto &id:inverted_list) {
+                    tableint internal_id = label_lookup_.find(id)->second;
+                    if (!(visited_array[internal_id]==visited_array_tag)) {
+                        visited_array[internal_id] = visited_array_tag;
+                        dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(internal_id, dist);
+                            max_candidate.emplace(internal_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+                }
+                if (!ivf.empty()) {
+                    int ivf_idx;
+                    dist_t dist = ivf.pop(ivf_idx);
+                    min_candidate.emplace(dist, ivf_idx);
+                }
+            } else {
+                tableint internal_id = top_node.id_;
+                int *data = (int *)get_linklist0(internal_id);
+                std::size_t size = getListCount((linklistsizeint *)data);
+#ifdef USE_SSE
+                _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+                _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#endif
+                for (std::size_t i=1; i<size; ++i) {
+                    int cand_id = *(data + i);
+#ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
+                    _mm_prefetch(data_level0_memory_ + (*(data + i + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);  ////////////
+#endif
+                    if (!(visited_array[cand_id] == visited_array_tag)) {
+                        visited_array[cand_id] = visited_array_tag;
+
+                        char *curr_data = (getDataByInternalId(cand_id));
+                        dist_t dist = fstdistfunc_(query, curr_data, dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(cand_id, dist);
+                            max_candidate.emplace(cand_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+
+        while(max_candidate.size() > k) {
+            max_candidate.pop();
+        }
+
+        while(max_candidate.size() > 0) {
+            // std::pair<dist_t, tableint> rez = top_candidates.top();
+            // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            for (std::size_t l=0; l<k; ++l) {
+                utils::Node<float> top_node = max_candidate.top();
+                result.emplace(top_node.id_, top_node.dist_, k-l-1);
+                max_candidate.pop();
+            }
+        }
+        // return result;
+    }
+
+
 
     void getNeighborsByHeuristic2(
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
-    const size_t M) {
+            const size_t M) {
         if (top_candidates.size() < M) {
             return;
         }
