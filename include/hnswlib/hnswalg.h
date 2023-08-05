@@ -8,9 +8,13 @@
 #include <assert.h>
 #include <unordered_set>
 #include <list>
+
+#include <boost/dynamic_bitset.hpp>
+
 #include <imi/imi.h>
 #include <imi/l2_inverted_list.h>
 #include <utils/result_utils.h>
+#include <utils/heap.h>
 
 namespace hnswlib {
 
@@ -212,6 +216,44 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
+    std::pair<dist_t, labeltype>
+    searchUpperLayer(const void *query_data, const float *data_ptr, const std::size_t data_dim) {
+        tableint currObj = enterpoint_node_;
+        const float* data = &data_ptr[getExternalLabel(enterpoint_node_) * data_dim];
+        dist_t curdist = fstdistfunc_(query_data, data, dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    const float *dd = &data_ptr[getExternalLabel(cand)*data_dim];
+                    dist_t d = fstdistfunc_(query_data, dd, dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::pair<dist_t, labeltype> result(curdist, getExternalLabel(currObj));
+        return result;
+    }
+
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -383,6 +425,97 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    template <bool has_deletions, bool collect_metrics = false>
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef, std::size_t &cal_cnt, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        dist_t lowerBound;
+        if ((!has_deletions || !isMarkedDeleted(ep_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id)))) {
+            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            ++cal_cnt;
+            lowerBound = dist;
+            top_candidates.emplace(dist, ep_id);
+            candidate_set.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidate_set.emplace(-lowerBound, ep_id);
+        }
+
+        visited_array[ep_id] = visited_array_tag;
+
+        while (!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+
+            if ((-current_node_pair.first) > lowerBound &&
+                (top_candidates.size() == ef || (!isIdAllowed && !has_deletions))) {
+                break;
+            }
+            candidate_set.pop();
+
+            tableint current_node_id = current_node_pair.second;
+            int *data = (int *) get_linklist0(current_node_id);
+            size_t size = getListCount((linklistsizeint*)data);
+//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+            if (collect_metrics) {
+                metric_hops++;
+                metric_distance_computations+=size;
+            }
+
+#ifdef USE_SSE
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+            for (size_t j = 1; j <= size; j++) {
+                int candidate_id = *(data + j);
+//                    if (candidate_id == 0) continue;
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                _MM_HINT_T0);  ////////////
+#endif
+                if (!(visited_array[candidate_id] == visited_array_tag)) {
+                    visited_array[candidate_id] = visited_array_tag;
+
+                    char *currObj1 = (getDataByInternalId(candidate_id));
+                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    ++cal_cnt;
+
+                    if (top_candidates.size() < ef || lowerBound > dist) {
+                        candidate_set.emplace(-dist, candidate_id);
+#ifdef USE_SSE
+                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+                                        offsetLevel0_,  ///////////
+                                        _MM_HINT_T0);  ////////////////////////
+#endif
+
+                        if ((!has_deletions || !isMarkedDeleted(candidate_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))
+                            top_candidates.emplace(dist, candidate_id);
+
+                        if (top_candidates.size() > ef)
+                            top_candidates.pop();
+
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
+    }
+
+
+
     void
     searchWithIMI(const void *query, size_t k, imi::ImiIndex &imi, utils::ResultPool<float> &result) const {
         std::size_t ef = std::max(ef_, k);
@@ -464,7 +597,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
                 if (!imi.empty()) {
                     dist_t dist = imi.get_next((float *)query, imi_row, imi_col);
-                    if (imi_row >= 0 && imi_col >= 0 && imi.size(imi_row, imi_col)) {
+                    if (dist < lower_bound && imi_row >= 0 && imi_col >= 0 && imi.size(imi_row, imi_col)) {
                         min_candidate.emplace(imi_row, imi_col, dist);
                     }
                 }
@@ -478,7 +611,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
       _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
       _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
 #endif
-                for (std::size_t i=1; i<size; ++i) {
+                for (std::size_t i=1; i<=size; ++i) {
                     int cand_id = *(data + i);
 #ifdef USE_SSE
                     _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
@@ -508,16 +641,163 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        visited_list_pool_->releaseVisitedList(vl);
+
         while(max_candidate.size() > k) {
             max_candidate.pop();
         }
 
         while(max_candidate.size() > 0) {
-            for (std::size_t l=0; l<k; ++l) {
-                utils::Node<float> top_node = max_candidate.top();
-                result.emplace(top_node.id_, top_node.dist_, k-l-1);
-                max_candidate.pop();
+            utils::Node<float> top_node = max_candidate.top();
+            result.insert(getExternalLabel(top_node.id_), top_node.dist_);
+            // result.emplace(top_node.id_, top_node.dist_, k-l-1);
+            max_candidate.pop();
+        }
+    }
+
+
+    void
+    searchWithIMI(const void *query, size_t k, imi::ImiIndex &imi, utils::ResultPool<float> &result,
+                  std::size_t &point_cnt, std::size_t &graph_cnt) const {
+        std::size_t ef = std::max(ef_, k);
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MinHeap<float>> min_candidate;
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MaxHeap<float>> max_candidate;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
             }
+        }
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        dist_t lower_bound;
+        dist_t dist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+        lower_bound = dist;
+        min_candidate.emplace(currObj, dist);
+        max_candidate.emplace(currObj, dist);
+
+        point_cnt += 1;
+        graph_cnt += 1;
+
+        visited_array[currObj] = visited_array_tag;
+
+        int imi_row, imi_col;
+        dist = imi.first((float *) query, imi_row, imi_col);
+        min_candidate.emplace(imi_row, imi_col, dist);
+
+        while(!min_candidate.empty()) {
+            utils::Node<float> top_node = min_candidate.top();
+            min_candidate.pop();
+
+            if (top_node.first_bit()) {
+                top_node.parse_id(imi_row, imi_col);
+                std::vector<std::size_t> inverted_list = imi.get_bucket(imi_row, imi_col);
+                for (const auto &id:inverted_list) {
+                    tableint internal_id = label_lookup_.find(id)->second;
+                    if (!(visited_array[internal_id]==visited_array_tag)) {
+                        point_cnt += 1;
+                        visited_array[internal_id] = visited_array_tag;
+                        dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(internal_id, dist);
+                            max_candidate.emplace(internal_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+                }
+                if (!imi.empty()) {
+                    dist_t dist = imi.get_next((float *)query, imi_row, imi_col);
+                    if (dist < lower_bound && imi_row >= 0 && imi_col >= 0 && imi.size(imi_row, imi_col)) {
+                        min_candidate.emplace(imi_row, imi_col, dist);
+                    }
+                }
+            } else {
+                tableint internal_id = top_node.id_;
+                int *data = (int *)get_linklist0(internal_id);
+                std::size_t size = getListCount((linklistsizeint *)data);
+#ifdef USE_SSE
+      _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+      _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+      _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+      _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#endif
+                for (std::size_t i=1; i<=size; ++i) {
+                    int cand_id = *(data + i);
+#ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
+                    _mm_prefetch(data_level0_memory_ + (*(data + i + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);  ////////////
+#endif
+                    if (!(visited_array[cand_id] == visited_array_tag)) {
+                        visited_array[cand_id] = visited_array_tag;
+                        point_cnt += 1;
+                        graph_cnt += 1;
+                        char *curr_data = (getDataByInternalId(cand_id));
+                        dist_t dist = fstdistfunc_(query, curr_data, dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(cand_id, dist);
+                            max_candidate.emplace(cand_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+
+        while(max_candidate.size() > k) {
+            max_candidate.pop();
+        }
+
+        while(max_candidate.size() > 0) {
+            utils::Node<float> top_node = max_candidate.top();
+            result.insert(getExternalLabel(top_node.id_), top_node.dist_);
+            // result.emplace(top_node.id_, top_node.dist_, k-l-1);
+            max_candidate.pop();
         }
     }
 
@@ -604,7 +884,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (!ivf.empty()) {
                     int ivf_idx;
                     dist_t dist = ivf.pop(ivf_idx);
-                    min_candidate.emplace(dist, ivf_idx);
+                    if (dist < lower_bound) {
+                        min_candidate.emplace(dist, ivf_idx);
+                    }
                 }
             } else {
                 tableint internal_id = top_node.id_;
@@ -616,7 +898,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
                 _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
 #endif
-                for (std::size_t i=1; i<size; ++i) {
+                for (std::size_t i=1; i<=size; ++i) {
                     int cand_id = *(data + i);
 #ifdef USE_SSE
                     _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
@@ -647,22 +929,259 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        visited_list_pool_->releaseVisitedList(vl);
+
         while(max_candidate.size() > k) {
             max_candidate.pop();
         }
 
         while(max_candidate.size() > 0) {
-            // std::pair<dist_t, tableint> rez = top_candidates.top();
-            // result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
-            for (std::size_t l=0; l<k; ++l) {
-                utils::Node<float> top_node = max_candidate.top();
-                result.emplace(top_node.id_, top_node.dist_, k-l-1);
-                max_candidate.pop();
-            }
+            utils::Node<float> top_node = max_candidate.top();
+            result.insert(getExternalLabel(top_node.id_), top_node.dist_);
+            // result.emplace(top_node.id_, top_node.dist_, k-l-1);
+            max_candidate.pop();
         }
         // return result;
     }
 
+
+    void
+    searchWithIVF(const void *query, size_t k, imi::InvertedList &ivf, utils::ResultPool<float> &result,
+                  std::size_t &point_cnt, std::size_t &graph_cnt) const {
+        std::size_t ef = std::max(ef_, k);
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MinHeap<float>> min_candidate;
+        std::priority_queue<utils::Node<float>, std::vector<utils::Node<float>>, utils::MaxHeap<float>> max_candidate;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        dist_t lower_bound;
+        dist_t dist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+        lower_bound = dist;
+        min_candidate.emplace(currObj, dist);
+        max_candidate.emplace(currObj, dist);
+
+        point_cnt += 1;
+        graph_cnt += 1;
+
+        visited_array[currObj] = visited_array_tag;
+
+        ivf.init((float *) query);
+        int ivf_idx;
+        dist = ivf.pop(ivf_idx);
+        min_candidate.emplace(dist, ivf_idx);
+
+        while(!min_candidate.empty()) {
+            utils::Node<float> top_node = min_candidate.top();
+            min_candidate.pop();
+
+            if (top_node.first_bit()) {
+                std::vector<std::size_t> inverted_list = ivf.get_bucket(top_node);
+                for (const auto &id:inverted_list) {
+                    tableint internal_id = label_lookup_.find(id)->second;
+                    if (!(visited_array[internal_id]==visited_array_tag)) {
+                        point_cnt += 1;
+                        visited_array[internal_id] = visited_array_tag;
+                        dist_t dist = fstdistfunc_(query, getDataByInternalId(internal_id), dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(internal_id, dist);
+                            max_candidate.emplace(internal_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+                }
+                if (!ivf.empty()) {
+                    int ivf_idx;
+                    dist_t dist = ivf.pop(ivf_idx);
+                    if (dist < lower_bound) {
+                        min_candidate.emplace(dist, ivf_idx);
+                    }
+                }
+            } else {
+                tableint internal_id = top_node.id_;
+                int *data = (int *)get_linklist0(internal_id);
+                std::size_t size = getListCount((linklistsizeint *)data);
+#ifdef USE_SSE
+                _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
+                _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#endif
+                for (std::size_t i=1; i<=size; ++i) {
+                    int cand_id = *(data + i);
+#ifdef USE_SSE
+                    _mm_prefetch((char *) (visited_array + *(data + i + 1)), _MM_HINT_T0);
+                    _mm_prefetch(data_level0_memory_ + (*(data + i + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);  ////////////
+#endif
+                    if (!(visited_array[cand_id] == visited_array_tag)) {
+                        visited_array[cand_id] = visited_array_tag;
+                        point_cnt += 1;
+                        graph_cnt += 1;
+                        char *curr_data = (getDataByInternalId(cand_id));
+                        dist_t dist = fstdistfunc_(query, curr_data, dist_func_param_);
+
+                        if (max_candidate.size() < ef || lower_bound > dist) {
+                            min_candidate.emplace(cand_id, dist);
+                            max_candidate.emplace(cand_id, dist);
+
+                            if (max_candidate.size() > ef) {
+                                max_candidate.pop();
+                            }
+
+                            if (!max_candidate.empty()) {
+                                lower_bound = max_candidate.top().dist_;
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+
+        while(max_candidate.size() > k) {
+            max_candidate.pop();
+        }
+
+        while(max_candidate.size() > 0) {
+            utils::Node<float> top_node = max_candidate.top();
+            result.insert(getExternalLabel(top_node.id_), top_node.dist_);
+            // result.emplace(top_node.id_, top_node.dist_, k-l-1);
+            max_candidate.pop();
+        }
+        // return result;
+    }
+
+
+    std::vector<utils::HeapItem<float, unsigned> >
+    searchKnn(const void *query_data, size_t k, std::size_t &cal_cnt) const {
+        // std::vector<utils::HeapItem<float, unsigned> > result;
+        if (cur_element_count == 0) return std::vector<utils::HeapItem<float, unsigned> >(0);
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+                cal_cnt += size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::priority_queue<utils::HeapItem<float, unsigned>, std::vector<utils::HeapItem<float, unsigned>>, 
+                            utils::HeapMin<float, unsigned>> candidates;
+        utils::Heap<float, unsigned> top_candidates(ef_);
+        std::vector<bool> visited_flags(cur_element_count, false);
+
+        dist_t lowerBound = curdist;
+        candidates.emplace(curdist, currObj);
+        top_candidates.push(curdist, currObj);
+        visited_flags[currObj] = true;
+
+        while(!candidates.empty()) {
+            utils::HeapItem<float, unsigned> top_node = candidates.top();
+            if (top_node.dist_ > top_candidates.top_dist() && top_candidates.fill()) {
+                break;
+            }
+
+            candidates.pop();
+
+            tableint curr_node_id = top_node.id_;
+            int *data = (int *) get_linklist0(curr_node_id);
+            std::size_t size = getListCount((linklistsizeint*)data);
+
+            metric_hops++;
+            metric_distance_computations += size;
+
+#ifdef USE_SSE
+            // _mm_prefetch((char *) &visited_flags[*(data + 1)], _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+
+            for (std::size_t j = 1; j <= size; ++j) {
+                int candidate_id = *(data + j);
+#ifdef USE_SSE
+                // _mm_prefetch((char *) &visited_flags[*(data + j + 1)], _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+#endif
+                if (!visited_flags[candidate_id]) {
+                    visited_flags[candidate_id] = true;
+
+                    dist_t dist = fstdistfunc_(query_data, getDataByInternalId(candidate_id), dist_func_param_);
+                    ++cal_cnt;
+
+                    if (!top_candidates.fill() || dist < top_candidates.top_dist()) {
+                        candidates.emplace(dist, candidate_id);
+                        top_candidates.push(dist, candidate_id);
+                    }
+                }
+            }
+        }
+        return top_candidates.get_topk(k);
+    }
 
 
     void getNeighborsByHeuristic2(
@@ -881,6 +1400,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         max_elements_ = new_max_elements;
     }
 
+     std::vector<unsigned > transformGraph() {
+//        char *new_l0_graph = (char *) malloc(max_elements_ * size_links_level0_);
+        std::vector<unsigned > l0_graph(max_elements_ * (maxM0_+1));
+
+        unsigned num_per_line = maxM0_ + 1;
+        for (std::size_t i=0; i<max_elements_; ++i) {
+            unsigned *new_l0 = &l0_graph[i * (maxM0_ + 1)];
+            tableint internal_id = label_lookup_.find(i)->second;
+            unsigned* data_level0 = (unsigned *)(data_level0_memory_ + internal_id * size_data_per_element_);
+            unsigned linklist_size = *data_level0;
+            new_l0[0] = linklist_size;
+            for (unsigned j=1; j<=linklist_size; ++j) {
+                new_l0[j] = getExternalLabel(data_level0[j]);
+            }
+            std::sort(new_l0+1, new_l0+1+linklist_size);
+            new_l0 += num_per_line;
+        }
+
+        return l0_graph;
+
+//        std::ofstream output(location, std::ios::binary);
+//
+//        writeBinaryPOD(output, max_elements_);
+//        writeBinaryPOD(output, maxM0_);
+//        output.write(new_l0_graph, max_elements_ * size_links_level0_);
+//        output.close();
+    }
+
 
     void saveIndex(const std::string &location) {
         std::ofstream output(location, std::ios::binary);
@@ -908,6 +1455,51 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             writeBinaryPOD(output, linkListSize);
             if (linkListSize)
                 output.write(linkLists_[i], linkListSize);
+        }
+        output.close();
+    }
+
+    void saveAngleIndex(char *data_ptr, const std::size_t data_dim, const std::string &location) {
+        std::ofstream output(location, std::ios::binary);
+        std::streampos position;
+
+        std::size_t n_data_size = data_dim * sizeof(float);
+        std::size_t n_offset_data = size_links_level0_;
+        std::size_t n_label_offset = offsetData_ + n_data_size;
+        std::size_t n_size_data_per_element = n_label_offset + sizeof(labeltype);
+
+        writeBinaryPOD(output, offsetLevel0_);
+        writeBinaryPOD(output, max_elements_);
+        writeBinaryPOD(output, cur_element_count);
+        writeBinaryPOD(output, n_size_data_per_element); // size_data_per_element_
+        writeBinaryPOD(output, n_label_offset); // label_offset_
+        writeBinaryPOD(output, n_offset_data); // offsetData_
+        writeBinaryPOD(output, maxlevel_);
+        writeBinaryPOD(output, enterpoint_node_);
+        writeBinaryPOD(output, maxM_);
+
+        writeBinaryPOD(output, maxM0_);
+        writeBinaryPOD(output, M_);
+        writeBinaryPOD(output, mult_);
+        writeBinaryPOD(output, ef_construction_);
+
+        char *new_level0_mem_ = (char *) malloc(max_elements_ * n_size_data_per_element);
+        for (std::size_t i=0; i<max_elements_; ++i) {
+            char *ele_ptr_n = new_level0_mem_ + i * n_size_data_per_element;
+            char *ele_ptr_o = data_level0_memory_ + i * size_data_per_element_;
+            std::copy(ele_ptr_o, ele_ptr_o+size_links_level0_, ele_ptr_n); // link_list_size+link_list
+            labeltype label = getExternalLabel(i);
+            char *data_p = data_ptr + label * n_data_size;
+            std::copy(data_p, data_p+n_data_size, ele_ptr_n+size_links_level0_); // vec_data
+            memcpy((ele_ptr_n+n_label_offset), &label, sizeof(labeltype)); // label
+        }
+
+        output.write(new_level0_mem_, cur_element_count * n_size_data_per_element);
+        for (size_t i = 0; i < cur_element_count; i++) {
+           unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+           writeBinaryPOD(output, linkListSize);
+           if (linkListSize)
+               output.write(linkLists_[i], linkListSize);
         }
         output.close();
     }
@@ -1508,6 +2100,62 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         } else {
             top_candidates = searchBaseLayerST<false, true>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
+        }
+
+        while (top_candidates.size() > k) {
+            top_candidates.pop();
+        }
+        while (top_candidates.size() > 0) {
+            std::pair<dist_t, tableint> rez = top_candidates.top();
+            result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
+            top_candidates.pop();
+        }
+        return result;
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnCnt(const void *query_data, size_t k, std::size_t &cal_cnt, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        std::priority_queue<std::pair<dist_t, labeltype >> result;
+        if (cur_element_count == 0) return result;
+
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations+=size;
+                cal_cnt += size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        if (num_deleted_) {
+            top_candidates = searchBaseLayerST<true, true>(
+                    currObj, query_data, std::max(ef_, k), cal_cnt, isIdAllowed);
+        } else {
+            top_candidates = searchBaseLayerST<false, true>(
+                    currObj, query_data, std::max(ef_, k), cal_cnt, isIdAllowed);
         }
 
         while (top_candidates.size() > k) {
