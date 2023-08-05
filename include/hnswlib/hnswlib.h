@@ -204,3 +204,4 @@ AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void* query_data, size_t 
 #include "space_min_l2.h"
 #include "bruteforce.h"
 #include "hnswalg.h"
+#include "recall.h"

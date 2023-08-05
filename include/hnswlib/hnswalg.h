@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <list>
 
-#include <utils/heap.h>
+#include "heap.h"
 // #include <utils/result_utils.h>
 
 namespace hnswlib {
@@ -1250,9 +1250,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    std::vector<utils::HeapItem<float, unsigned> >
+    std::vector<HeapItem<float, unsigned> >
     searchKnnOpt(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
-        if (cur_element_count == 0) return std::vector<utils::HeapItem<float, unsigned>>(0);
+        if (cur_element_count == 0) return std::vector<HeapItem<float, unsigned>>(0);
 
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
@@ -1287,9 +1287,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
-        std::priority_queue<utils::HeapItem<float, unsigned>, std::vector<utils::HeapItem<float, unsigned>>, 
-                            utils::HeapMin<float, unsigned> > candidates;
-        utils::Heap<float, unsigned> top_candidates(ef_);
+        std::priority_queue<HeapItem<float, unsigned>, std::vector<HeapItem<float, unsigned>>, 
+                            HeapMin<float, unsigned> > candidates;
+        Heap<float, unsigned> top_candidates(ef_);
         std::vector<bool> visited_flags(cur_element_count, false);
 
         dist_t lowerBound = curdist;
@@ -1298,7 +1298,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         visited_flags[currObj] = true;
 
         while(!candidates.empty()) {
-            utils::HeapItem<float, unsigned> top_node = candidates.top();
+            HeapItem<float, unsigned> top_node = candidates.top();
             if (top_node.dist_ > top_candidates.top_dist() && top_candidates.fill()) {
                 break;
             }
@@ -1372,4 +1372,5 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
     }
 };
+
 }  // namespace hnswlib
