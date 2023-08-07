@@ -56,8 +56,8 @@ namespace hnswlib {
                 std::size_t idx = 0;
                 std::size_t child_idx = 2 * idx + 1; // left child
                 // std::size_t child_idx = 2 * (idx + 1);
-                while (child_idx <= mass_.size() - 1) {
-                    if (child_idx+1<=mass_.size()-1 && mass_[child_idx]<mass_[child_idx+1]) {
+                while (child_idx < mass_.size()) {
+                    if (child_idx+1<mass_.size() && mass_[child_idx]<mass_[child_idx+1]) {
                         ++child_idx;
                     }
                     if (mass_[idx] < mass_[child_idx]) {
@@ -89,39 +89,14 @@ namespace hnswlib {
 
         std::vector<HeapItem<DistType, IdType> >
         get_topk(int topk) {
-            if (mass_.size() <= topk) {
-                std::sort(mass_.begin(), mass_.end());
-                return mass_;
-            } else {
-                std::vector<HeapItem<DistType, IdType> > result;
-                // result.assign(mass_.begin()+idx, mass_.begin()+idx+topk);
-                result.assign(mass_.end()-topk, mass_.end());
-                std::sort(result.begin(), result.end());
+            //  std::sort(mass_.begin(), mass_.end());
+            //  std::vector<HeapItem<DistType, IdType> > result;
+            //  result.assign(mass_.begin(), mass_.begin()+topk);
+            //  return result;
 
-                std::size_t idx;
-                if (mass_.size() / 2 > topk) {
-                    idx = mass_.size() / 2;
-                } else {
-                    idx = 0;
-                }
-                for (auto it = mass_.begin()+idx; it < mass_.end()-topk; ++it) {
-                    DistType dist = it->dist_;
-                    if(dist < result[topk-1].dist_) {
-                        int i;
-                        for (i=topk-2; i>=0; --i) {
-                            if (dist < result[i].dist_) {
-                                result[i+1] = result[i];
-                            } else {
-                                break;
-                            }
-                        }
-                        result[i+1] = *it;
-                    }
-                }
-                // std::size_t idx = mass_.size() / 2;
-                // std::partial_sort_copy(mass_.begin()+idx, mass_.end(), result.begin(), result.end());
-                return result;
-            }
+            std::vector<HeapItem<DistType, IdType> > result(topk);
+            std::partial_sort_copy(mass_.begin(), mass_.end(), result.begin(), result.end());
+            return result;
         }
 
         void print() {

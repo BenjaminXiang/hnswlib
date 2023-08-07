@@ -356,6 +356,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    if (collect_metrics) {
+                        real_cnt++;
+                    }
 
                     if (top_candidates.size() < ef || lowerBound > dist) {
                         candidate_set.emplace(-dist, candidate_id);
@@ -1200,10 +1203,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
-                // if (collect_metrics) {
+                if (collect_metrics) {
+                    real_cnt++;
                     metric_hops++;
                     metric_distance_computations+=size;
-                // }
+                }
 
                 tableint *datal = (tableint *) (data + 1);
                 for (int i = 0; i < size; i++) {
@@ -1309,8 +1313,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             int *data = (int *) get_linklist0(curr_node_id);
             std::size_t size = getListCount((linklistsizeint*)data);
 
-            metric_hops++;
-            metric_distance_computations += size;
+            if (collect_metrics) {
+                metric_hops++;
+                metric_distance_computations += size;
+            }
 
 #ifdef USE_SSE
             _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
@@ -1326,7 +1332,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     visited_flags[candidate_id] = true;
 
                     dist_t dist = fstdistfunc_(query_data, getDataByInternalId(candidate_id), dist_func_param_);
-                    real_cnt++;
+                    if (collect_metrics) {
+                        real_cnt++;
+                    }
 
                     if (!top_candidates.fill() || dist < top_candidates.top_dist()) {
                         candidates.emplace(dist, candidate_id);
