@@ -78,7 +78,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
     bool sin_only = true;
-    float alpha = 0.1;
+    float alpha = 0.1, beta = 1;
     float *length_{nullptr};
     std::vector<std::pair<labeltype, tableint>> edges;
     void getEdgesLayer0SQ8() {
@@ -286,16 +286,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t lowerBound;
         dist_t length = fstdistfunc_(data_point, data_point, dist_func_param_);
         if (!isMarkedDeleted(ep_id)) {
+            // dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            // // std::cout << sqrt(1 - dist * dist / (length * length_[getExternalLabel(ep_id)])) * sqrt(length * length_[getExternalLabel(ep_id)]) << '\n';
+            // // dist = length * length_[getExternalLabel(ep_id)] - dist * dist;
+            // // std::cout << sqrt(dist) << '\n';
+            // if (sin_only) {
+            //     dist = sqrt(1 - dist * dist / (length * length_[getExternalLabel(ep_id)]));
+            //     dist = pow(sqrt(length * length_[getExternalLabel(ep_id)]), alpha) * dist;
+            // } else {
+            //     dist = length * length_[getExternalLabel(ep_id)] - dist * dist;
+            // }
             dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
-            // std::cout << sqrt(1 - dist * dist / (length * length_[getExternalLabel(ep_id)])) * sqrt(length * length_[getExternalLabel(ep_id)]) << '\n';
-            // dist = length * length_[getExternalLabel(ep_id)] - dist * dist;
-            // std::cout << sqrt(dist) << '\n';
-            if (sin_only) {
-                dist = sqrt(1 - dist * dist / (length * length_[getExternalLabel(ep_id)]));
-                dist = pow(sqrt(length * length_[getExternalLabel(ep_id)]), alpha) * dist;
-            } else {
-                dist = length * length_[getExternalLabel(ep_id)] - dist * dist;
-            }
+            float l1 = length, l2 = length_[getExternalLabel(ep_id)];
+            float L = sqrt(l1 * l2);
+            float S = sqrt(1 - dist * dist / (l1 * l2));
+            dist = pow(L, alpha) * pow(S, beta);
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             candidateSet.emplace(-dist, ep_id);
@@ -343,13 +348,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 visited_array[candidate_id] = visited_array_tag;
                 char *currObj1 = (getDataByInternalId(candidate_id));
 
+                // dist_t dist1 = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                // if (sin_only) {
+                //     dist1 = sqrt(1 - dist1 * dist1 / (length * length_[getExternalLabel(ep_id)]));
+                //     dist1 = pow(sqrt(length * length_[getExternalLabel(candidate_id)]), alpha) * dist1;
+                // } else {
+                //     dist1 = length * length_[getExternalLabel(candidate_id)] - dist1 * dist1;
+                // }
                 dist_t dist1 = fstdistfunc_(data_point, currObj1, dist_func_param_);
-                if (sin_only) {
-                    dist1 = sqrt(1 - dist1 * dist1 / (length * length_[getExternalLabel(ep_id)]));
-                    dist1 = pow(sqrt(length * length_[getExternalLabel(candidate_id)]), alpha) * dist1;
-                } else {
-                    dist1 = length * length_[getExternalLabel(candidate_id)] - dist1 * dist1;
-                }
+                float l1 = length, l2 = length_[getExternalLabel(candidate_id)];
+                float L = sqrt(l1 * l2);
+                float S = sqrt(1 - dist1 * dist1 / (l1 * l2));
+                dist1 = pow(L, alpha) * pow(S, beta);
+
                 if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
                     candidateSet.emplace(-dist1, candidate_id);
 #ifdef USE_SSE
@@ -1314,16 +1325,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             bool good = true;
 
             for (std::pair<dist_t, tableint> second_pair : return_list) {
+                // dist_t curdist =
+                //         fstdistfunc_(getDataByInternalId(second_pair.second),
+                //                         getDataByInternalId(curent_pair.second),
+                //                         dist_func_param_);
+                // if (sin_only) {
+                //     curdist = sqrt(1 - curdist * curdist / (length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)]));
+                //     curdist = pow(sqrt(length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)]), alpha) * curdist;
+                // } else {
+                //     curdist = length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)] - curdist * curdist;
+                // }
                 dist_t curdist =
                         fstdistfunc_(getDataByInternalId(second_pair.second),
                                         getDataByInternalId(curent_pair.second),
                                         dist_func_param_);
-                if (sin_only) {
-                    curdist = sqrt(1 - curdist * curdist / (length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)]));
-                    curdist = pow(sqrt(length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)]), alpha) * curdist;
-                } else {
-                    curdist = length_[getExternalLabel(second_pair.second)] * length_[getExternalLabel(curent_pair.second)] - curdist * curdist;
-                }
+                float l1 = length_[getExternalLabel(second_pair.second)], l2 = length_[getExternalLabel(curent_pair.second)];
+                float L = sqrt(l1 * l2);
+                float S = sqrt(1 - curdist * curdist / (l1 * l2));
+                curdist = pow(L, alpha) * pow(S, beta);
                 if (curdist < dist_to_query) {
                     good = false;
                     break;
@@ -1445,26 +1464,39 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     setListCount(ll_other, sz_link_list_other + 1);
                 } else {
                     // finding the "weakest" element to replace it with the new one
-                    dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
-                                                dist_func_param_);
-                    if (sin_only) {
-                        d_max = sqrt(1 - d_max * d_max / (length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])]));
-                        d_max = pow(sqrt(length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])]), alpha) * d_max;
-                    } else {
-                        d_max = length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])] - d_max * d_max;
-                    }
+                    // dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
+                    //                             dist_func_param_);
+                    // if (sin_only) {
+                    //     d_max = sqrt(1 - d_max * d_max / (length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])]));
+                    //     d_max = pow(sqrt(length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])]), alpha) * d_max;
+                    // } else {
+                    //     d_max = length_[getExternalLabel(cur_c)] * length_[getExternalLabel(selectedNeighbors[idx])] - d_max * d_max;
+                    // }
+                    dist_t d_max =
+                        fstdistfunc_(getDataByInternalId(cur_c),
+                                    getDataByInternalId(selectedNeighbors[idx]),
+                                    dist_func_param_);
+                    float l1 = length_[getExternalLabel(cur_c)], l2 = length_[getExternalLabel(selectedNeighbors[idx])];
+                    float L = sqrt(l1 * l2);
+                    float S = sqrt(1 - d_max * d_max / (l1 * l2));
+                    d_max = pow(L, alpha) * pow(S, beta);
                     // Heuristic:
                     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
                     candidates.emplace(d_max, cur_c);
 
                     for (size_t j = 0; j < sz_link_list_other; j++) {
+                        // dist_t d = fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(selectedNeighbors[idx]), dist_func_param_);
+                        // if (sin_only) {
+                        //     d = sqrt(1 - d * d / (length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])]));
+                        //     d = pow(sqrt(length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])]), alpha) * d;
+                        // } else {
+                        //     d = length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])] - d * d;
+                        // }
                         dist_t d = fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(selectedNeighbors[idx]), dist_func_param_);
-                        if (sin_only) {
-                            d = sqrt(1 - d * d / (length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])]));
-                            d = pow(sqrt(length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])]), alpha) * d;
-                        } else {
-                            d = length_[getExternalLabel(data[j])] * length_[getExternalLabel(selectedNeighbors[idx])] - d * d;
-                        }
+                        float l1 = length_[getExternalLabel(data[j])], l2 = length_[getExternalLabel(selectedNeighbors[idx])];
+                        float L = sqrt(l1 * l2);
+                        float S = sqrt(1 - d * d / (l1 * l2));
+                        d = pow(L, alpha) * pow(S, beta);
                         candidates.emplace(d, data[j]);
                     }
 
@@ -2128,13 +2160,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if ((signed)currObj != -1) {
             if (curlevel < maxlevelcopy) {
+                // dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
+                // if (sin_only) {
+                //     curdist = sqrt(1 - curdist * curdist / (length_[label] * length_[getExternalLabel(currObj)]));
+                //     curdist = pow(sqrt(length_[label] * length_[getExternalLabel(currObj)]), alpha) * curdist;
+                // } else {
+                //     curdist = length_[label] * length_[getExternalLabel(currObj)] - curdist * curdist;
+                // }
                 dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
-                if (sin_only) {
-                    curdist = sqrt(1 - curdist * curdist / (length_[label] * length_[getExternalLabel(currObj)]));
-                    curdist = pow(sqrt(length_[label] * length_[getExternalLabel(currObj)]), alpha) * curdist;
-                } else {
-                    curdist = length_[label] * length_[getExternalLabel(currObj)] - curdist * curdist;
-                }
+                float l1 = length_[label], l2 = length_[getExternalLabel(currObj)];
+                float L = sqrt(l1 * l2);
+                float S = sqrt(1 - curdist * curdist / (l1 * l2));
+                curdist = pow(L, alpha) * pow(S, beta);
                 for (int level = maxlevelcopy; level > curlevel; level--) {
                     bool changed = true;
                     while (changed) {
@@ -2149,13 +2186,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             tableint cand = datal[i];
                             if (cand < 0 || cand > max_elements_)
                                 throw std::runtime_error("cand error");
+                            // dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand), dist_func_param_);
+                            // if (sin_only) {
+                            //     d = sqrt(1 - d * d / (length_[label] * length_[getExternalLabel(cand)]));
+                            //     d = pow(sqrt(d = length_[label] * length_[getExternalLabel(cand)]), alpha) * d;
+                            // } else {
+                            //     d = length_[label] * length_[getExternalLabel(cand)] - d * d;
+                            // }
                             dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand), dist_func_param_);
-                            if (sin_only) {
-                                d = sqrt(1 - d * d / (length_[label] * length_[getExternalLabel(cand)]));
-                                d = pow(sqrt(d = length_[label] * length_[getExternalLabel(cand)]), alpha) * d;
-                            } else {
-                                d = length_[label] * length_[getExternalLabel(cand)] - d * d;
-                            }
+                            float l1 = length_[label], l2 = length_[getExternalLabel(cand)];
+                            float L = sqrt(l1 * l2);
+                            float S = sqrt(1 - d * d / (l1 * l2));
+                            d = pow(L, alpha) * pow(S, beta);
                             if (d < curdist) {
                                 curdist = d;
                                 currObj = cand;
